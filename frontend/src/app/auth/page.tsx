@@ -62,15 +62,15 @@ function AuthContent() {
                     try {
                         const profRes = await fetch(`${baseUrl}/api/artisans/${data.user.id}`);
                         if (profRes.ok) {
-                            router.push("/artisan/dashboard");
+                            window.location.href = "/artisan/dashboard";
                         } else {
-                            router.push("/artisan/complete-profile");
+                            window.location.href = "/artisan/complete-profile";
                         }
                     } catch {
-                        router.push("/artisan/complete-profile");
+                        window.location.href = "/artisan/complete-profile";
                     }
                 } else {
-                    router.push("/marketplace");
+                    window.location.href = "/marketplace";
                 }
             } else {
                 // Registration successful, switch to login
