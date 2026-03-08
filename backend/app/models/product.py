@@ -35,7 +35,12 @@ class ProductUpdate(BaseModel):
     price: Optional[float] = None
     category: Optional[str] = None
     tags: Optional[list[str]] = None
+    seo_keywords: Optional[list[str]] = None
     status: Optional[str] = None  # "draft", "published"
+    is_published: Optional[bool] = None
+    is_available: Optional[bool] = None
+    raw_voice_text: Optional[str] = None
+    ai_generated: Optional[bool] = None
 
 
 class ProductResponse(ProductBase):
@@ -43,6 +48,7 @@ class ProductResponse(ProductBase):
     product_id: str
     artisan_id: str
     status: str = "draft"
+    is_published: bool = False
     created_at: datetime
 
     class Config:

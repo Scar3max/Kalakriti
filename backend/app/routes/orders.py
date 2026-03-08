@@ -3,6 +3,7 @@ Order routes — prototype order placement (no payment).
 """
 
 from fastapi import APIRouter, HTTPException
+import uuid
 from app.models.order import OrderCreate, OrderResponse
 from app.database import get_db
 
@@ -13,28 +14,47 @@ router = APIRouter()
 async def place_order(order: OrderCreate):
     """Place a prototype order (no real payment)."""
     db = get_db()
-    
-    # Needs a valid product price, let's look it up
-    product_res = db.table("products").select("price").eq("id", order.product_id).execute()
+
+    # Look up product price using correct PK column
+    product_res = (
+        db.table("products")
+        .select("price, artisan_id")
+        .eq("product_id", order.product_id)
+        .execute()
+    )
     if not product_res.data:
         raise HTTPException(status_code=404, detail="Product not found")
-        
+
     price = product_res.data[0]["price"]
 
-    # In a real app we'd match buyer_email to a users table via Supabase Auth
-    # but here we'll just insert standard record
-    response = db.table("orders").insert({
+    # Build the order record matching the DB schema
+    order_data = {
+        "order_id": str(uuid.uuid4()),
         "product_id": order.product_id,
-        "amount": price,
-        "status": "pending"
-    }).execute()
-    
+        "total_amount": price,
+        "currency": "INR",
+        "payment_status": "pending",
+        "shipping_status": "not_shipped",
+        "shipping_address": {
+            "name": order.buyer_name,
+            "email": order.buyer_email,
+            "phone": order.buyer_phone or "",
+            "message": order.message or "",
+        },
+    }
+
+    # Add buyer_id if provided (from authenticated user)
+    if order.buyer_id:
+        order_data["buyer_id"] = order.buyer_id
+
+    response = db.table("orders").insert(order_data).execute()
+
     if not response.data:
         raise HTTPException(status_code=400, detail="Failed to place order")
-        
+
     return {
         "message": "Order placed (prototype)",
-        "order_id": response.data[0]["id"],
+        "order_id": response.data[0]["order_id"],
         "payment_status": "prototype",
     }
 
@@ -43,8 +63,12 @@ async def place_order(order: OrderCreate):
 async def get_order(order_id: str):
     """Get order details / receipt."""
     db = get_db()
-    response = db.table("orders").select("*, products(*)").eq("id", order_id).execute()
+    response = (
+        db.table("orders")
+        .select("*, order_items(*, products(title, image_url, price))")
+        .eq("order_id", order_id)
+        .execute()
+    )
     if not response.data:
         raise HTTPException(status_code=404, detail="Order not found")
     return {"order": response.data[0]}
-

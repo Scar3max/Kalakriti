@@ -29,8 +29,9 @@ class Settings:
     CLOUDINARY_API_KEY: str = os.getenv("CLOUDINARY_API_KEY", "")
     CLOUDINARY_API_SECRET: str = os.getenv("CLOUDINARY_API_SECRET", "")
 
-    # --- AI Services ---
-    AI_API_KEY: str = os.getenv("AI_API_KEY", "")
+    # --- AI Services (Groq) ---
+    GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+    AI_API_KEY: str = os.getenv("AI_API_KEY", "")  # legacy alias
     AI_PROVIDER: str = os.getenv("AI_PROVIDER", "groq")  # groq | openai | gemini
 
     # --- Speech to Text ---

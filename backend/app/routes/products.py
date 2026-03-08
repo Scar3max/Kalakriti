@@ -2,11 +2,14 @@
 Product routes — CRUD operations + AI content generation trigger.
 """
 
-from fastapi import APIRouter, HTTPException, Query
-from typing import Optional
+from fastapi import APIRouter, Depends, HTTPException, Query
+from typing import List, Optional
+import uuid
 from app.models.product import ProductCreate, ProductUpdate, ProductResponse
 from app.database import get_db
 from app.ai.content_generator import generate_product_content
+from app.ai.speech_to_text import transcribe_audio
+from app.ai.image_analyzer import analyze_image
 
 router = APIRouter()
 
@@ -22,9 +25,11 @@ async def list_products(
 ):
     """List products with optional filters and pagination."""
     db = get_db()
-    
-    # By default only fetch published products
-    query = db.table("products").select("*, artisans(*)").eq("status", "published")
+
+    # Fetch published products, joining artisan + user info
+    query = db.table("products").select(
+        "*, artisans(*, users(name, email))"
+    ).eq("status", "published")
 
     if category:
         query = query.eq("category", category)
@@ -33,12 +38,21 @@ async def list_products(
 
     # Pagination calculation
     offset = (page - 1) * limit
-    
+
     response = query.range(offset, offset + limit - 1).execute()
-    
+
+    # Flatten artisan name into each product for frontend convenience
+    products = []
+    for p in response.data:
+        artisan_data = p.get("artisans") or {}
+        user_data = artisan_data.pop("users", {}) or {}
+        artisan_data["name"] = user_data.get("name", "Unknown Artisan")
+        p["artisans"] = artisan_data
+        products.append(p)
+
     return {
-        "products": response.data,
-        "total": len(response.data), # For MVP simplicity
+        "products": products,
+        "total": len(products),
         "page": page,
         "limit": limit,
     }
@@ -48,35 +62,80 @@ async def list_products(
 async def get_product(product_id: str):
     """Get a single product by ID."""
     db = get_db()
-    response = db.table("products").select("*, artisans(*)").eq("id", product_id).execute()
+    response = db.table("products").select(
+        "*, artisans(*, users(name, email, phone))"
+    ).eq("product_id", product_id).execute()
+
     if not response.data:
         raise HTTPException(status_code=404, detail="Product not found")
-    return {"product": response.data[0]}
+
+    product = response.data[0]
+    # Flatten artisan name
+    artisan_data = product.get("artisans") or {}
+    user_data = artisan_data.pop("users", {}) or {}
+    artisan_data["name"] = user_data.get("name", "Unknown Artisan")
+    artisan_data["email"] = user_data.get("email", "")
+    artisan_data["phone"] = user_data.get("phone", "")
+    product["artisans"] = artisan_data
+
+    return {"product": product}
 
 
 @router.post("/", response_model=dict)
 async def create_product(product: ProductCreate):
     """Create a new product listing (draft)."""
     db = get_db()
-    response = db.table("products").insert({
-        "artisan_id": product.artisan_id,
-        "price": product.price,
-        "image_url": product.image_url,
-        "audio_url": product.audio_url,
-        "status": "draft"
-    }).execute()
     
+    # Resolve artisan_id from user_id if needed
+    artisan_id_to_use = product.artisan_id
+    artisan_check = db.table("artisans").select("artisan_id").eq("artisan_id", artisan_id_to_use).execute()
+    if not artisan_check.data:
+        # Check if the id provided is actually a user_id
+        user_check = db.table("artisans").select("artisan_id").eq("user_id", artisan_id_to_use).execute()
+        if user_check.data:
+            artisan_id_to_use = user_check.data[0]["artisan_id"]
+        else:
+            raise HTTPException(status_code=400, detail="Artisan profile not found for this user.")
+
+    product_id = str(uuid.uuid4())
+    response = db.table("products").insert({
+        "product_id": product_id,
+        "artisan_id": artisan_id_to_use,
+        "price": product.price,
+        "image_url": product.image_url or "",
+        "audio_url": product.audio_url,
+        "title": "Untitled Draft",
+        "description": "Pending AI generation",
+        "category": "General",
+        "status": "draft",
+        "is_published": False,
+        "is_available": True,
+        "is_flagged": False,
+        "ai_generated": False,
+        "stock_quantity": 1,
+        "currency": "INR",
+        "language": "en",
+    }).execute()
+
     if not response.data:
-        raise HTTPException(status_code=400, detail="Failed to create product list")
-        
-    return {"message": "Product creation successful", "product_id": response.data[0]["id"]}
+        raise HTTPException(status_code=400, detail="Failed to create product listing")
+
+    return {
+        "message": "Product creation successful",
+        "product_id": response.data[0]["product_id"],
+    }
 
 
 @router.put("/{product_id}", response_model=dict)
 async def update_product(product_id: str, product: ProductUpdate):
     """Update an existing product (e.g. after AI generation or manual edit)."""
     db = get_db()
-    response = db.table("products").update(product.dict(exclude_unset=True)).eq("id", product_id).execute()
+    response = (
+        db.table("products")
+        .update(product.dict(exclude_unset=True))
+        .eq("product_id", product_id)
+        .execute()
+    )
     if not response.data:
         raise HTTPException(status_code=400, detail="Failed to update product")
     return {"message": "Product updated successfully", "product": response.data[0]}
@@ -84,38 +143,71 @@ async def update_product(product_id: str, product: ProductUpdate):
 
 @router.post("/{product_id}/generate", response_model=dict)
 async def generate_ai_content(product_id: str):
-    """Trigger AI pipeline to generate title, description, story, and tags."""
+    """
+    Trigger the full AI pipeline:
+    1. Speech-to-text (if audio_url present)
+    2. Image analysis (if image_url present)
+    3. Content generation using transcription + image analysis
+    4. Update product with generated content
+    """
     db = get_db()
-    
-    # 1. Fetch product data (must include image_url and/or audio_url)
-    product_res = db.table("products").select("*").eq("id", product_id).execute()
+
+    # 1. Fetch product data
+    product_res = (
+        db.table("products")
+        .select("*")
+        .eq("product_id", product_id)
+        .execute()
+    )
     if not product_res.data:
         raise HTTPException(status_code=404, detail="Product not found")
-        
+
     product = product_res.data[0]
-    
-    # 2. Invoke AI Pipeline
-    # Using dummy values for now until STT and CV actually feed the content generator
-    # For a real integration we would first pass audio->whisper and image->vision
-    # then combine results into a text prompt.
-    base_info = f"Product Image URL: {product.get('image_url', 'N/A')} and Audio Transcription: (pending)"
-    ai_content = await generate_product_content(base_info)
-    
-    # 3. Update Product with AI generated fields
+
+    # 2. Speech-to-Text — transcribe the voice recording
+    transcription = ""
+    if product.get("audio_url"):
+        try:
+            transcription = await transcribe_audio(product["audio_url"])
+        except Exception as e:
+            print(f"[AI] Speech-to-text failed: {e}")
+            transcription = ""
+
+    # 3. Image Analysis — extract visual metadata
+    image_analysis = None
+    if product.get("image_url"):
+        try:
+            image_analysis = await analyze_image(product["image_url"])
+        except Exception as e:
+            print(f"[AI] Image analysis failed: {e}")
+            image_analysis = None
+
+    # 4. Content Generation — create title, description, cultural story, tags
+    raw_text = transcription or "A handmade Indian craft product"
+    ai_content = await generate_product_content(raw_text, image_analysis)
+
+    # 5. Update product with AI-generated fields
     update_data = {
-        "title": ai_content.get("title"),
-        "short_description": ai_content.get("short_description"),
-        "full_description": ai_content.get("full_description"),
-        "cultural_story": ai_content.get("cultural_story"),
-        "category": ai_content.get("category"),
-        "tags": ai_content.get("tags")
+        "title": ai_content.get("title", "Untitled"),
+        "description": ai_content.get("full_description") or ai_content.get("short_description", ""),
+        "cultural_story": ai_content.get("cultural_story", ""),
+        "category": ai_content.get("category", "General"),
+        "tags": ai_content.get("tags", []),
+        "seo_keywords": ai_content.get("seo_keywords", []),
+        "raw_voice_text": transcription,
+        "ai_generated": True,
     }
-    
-    update_res = db.table("products").update(update_data).eq("id", product_id).execute()
-    
+
+    update_res = (
+        db.table("products")
+        .update(update_data)
+        .eq("product_id", product_id)
+        .execute()
+    )
+
     return {
         "message": "AI generation successful",
-        "product": update_res.data[0] if update_res.data else None
+        "product": update_res.data[0] if update_res.data else None,
     }
 
 
@@ -123,7 +215,12 @@ async def generate_ai_content(product_id: str):
 async def publish_product(product_id: str):
     """Publish a draft product to the marketplace."""
     db = get_db()
-    response = db.table("products").update({"status": "published"}).eq("id", product_id).execute()
+    response = (
+        db.table("products")
+        .update({"status": "published", "is_published": True})
+        .eq("product_id", product_id)
+        .execute()
+    )
     if not response.data:
         raise HTTPException(status_code=400, detail="Failed to publish product")
     return {"message": "Product published successfully", "product": response.data[0]}

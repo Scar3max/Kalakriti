@@ -32,13 +32,20 @@ class UserResponse(UserBase):
 
 
 class ArtisanProfile(BaseModel):
-    """Extended profile for artisan users."""
+    """Extended profile for artisan users — matches DB artisans table."""
+    name: Optional[str] = None
+    email: Optional[str] = None
     artisan_id: Optional[str] = None
-    user_id: str
+    user_id: Optional[str] = None
     craft_type: Optional[str] = None
     bio: Optional[str] = None
-    rating: float = 0.0
-    verification_status: str = "pending"
+    location: Optional[str] = None
+    state: Optional[str] = None
+    city: Optional[str] = None
+    rating: Optional[float] = 0.0
+    total_reviews: Optional[int] = 0
+    verification_status: Optional[str] = "pending"
+    profile_image_url: Optional[str] = None
 
     class Config:
         from_attributes = True
